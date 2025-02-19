@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     TypedDict,
     Union,
 )
@@ -44,7 +45,7 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .fragment import FragmentMetadata, LanceFragment
+from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
     Compaction,
@@ -101,6 +102,30 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
 
         return super(MergeInsertBuilder, self).execute(reader)
+
+    def execute_uncommitted(
+        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
+    ) -> Tuple[Transaction, Dict[str, Any]]:
+        """Executes the merge insert operation without committing
+
+        This function updates the original dataset and returns a dictionary with
+        information about merge statistics - i.e. the number of inserted, updated,
+        and deleted rows.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+
+        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
     # These next three overrides exist only to document the methods
 
@@ -889,7 +914,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
-            return self.scanner(filter=filter).count_rows()
+            return self.scanner(
+                columns=[], with_row_id=True, filter=filter
+            ).count_rows()
 
         return self._ds.count_rows(filter)
 
@@ -1902,7 +1929,7 @@ class LanceDataset(pa.dataset.Dataset):
         valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only {valid_index_types} index types supported. " f"Got {index_type}"
+                f"Only {valid_index_types} index types supported. Got {index_type}"
             )
         if index_type != "IVF_PQ" and one_pass_ivfpq:
             raise ValueError(
@@ -2197,6 +2224,17 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return self
 
+    def drop_index(self, name: str):
+        """
+        Drops an index from the dataset
+
+        Note: Indices are dropped by "index name".  This is not the same as the field
+        name. If you did not specify a name when you created the index then a name was
+        generated for you.  You can use the `list_indices` method to get the names of
+        the indices.
+        """
+        return self._ds.drop_index(name)
+
     def session(self) -> Session:
         """
         Return the dataset session, which holds the dataset's state.
@@ -2211,8 +2249,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
         warnings.warn(
-            "LanceDataset._commit() is deprecated, use LanceDataset.commit()"
-            " instead",
+            "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
         return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
@@ -2220,7 +2257,7 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit(
         base_uri: Union[str, Path, LanceDataset],
-        operation: LanceOperation.BaseOperation,
+        operation: Union[LanceOperation.BaseOperation, Transaction],
         blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
@@ -2326,24 +2363,45 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        if read_version is None and not isinstance(
-            operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+        if (
+            isinstance(operation, LanceOperation.BaseOperation)
+            and read_version is None
+            and not isinstance(
+                operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+            )
         ):
             raise ValueError(
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
-        new_ds = _Dataset.commit(
-            base_uri,
-            operation,
-            blobs_op,
-            read_version,
-            commit_lock,
-            storage_options=storage_options,
-            enable_v2_manifest_paths=enable_v2_manifest_paths,
-            detached=detached,
-            max_retries=max_retries,
-        )
+        if isinstance(operation, Transaction):
+            new_ds = _Dataset.commit_transaction(
+                base_uri,
+                operation,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        elif isinstance(operation, LanceOperation.BaseOperation):
+            new_ds = _Dataset.commit(
+                base_uri,
+                operation,
+                blobs_op,
+                read_version,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        else:
+            raise TypeError(
+                "operation must be a LanceOperation.BaseOperation or Transaction, "
+                f"got {type(operation)}"
+            )
+
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
         ds._ds = new_ds
@@ -2723,6 +2781,29 @@ class LanceOperation:
             LanceOperation._validate_fragments(self.updated_fragments)
 
     @dataclass
+    class Update(BaseOperation):
+        """
+        Operation that updates rows in the dataset.
+
+        Attributes
+        ----------
+        removed_fragment_ids: list[int]
+            The ids of the fragments that have been removed entirely.
+        updated_fragments: list[FragmentMetadata]
+            The fragments that have been updated with new deletion vectors.
+        new_fragments: list[FragmentMetadata]
+            The fragments that contain the new rows.
+        """
+
+        removed_fragment_ids: List[int]
+        updated_fragments: List[FragmentMetadata]
+        new_fragments: List[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
+
+    @dataclass
     class Merge(BaseOperation):
         """
         Operation that adds columns. Unlike Overwrite, this should not change
@@ -2854,6 +2935,23 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
+
+    @dataclass
+    class DataReplacementGroup:
+        """
+        Group of data replacements
+        """
+
+        fragment_id: int
+        new_file: DataFile
+
+    @dataclass
+    class DataReplacement(BaseOperation):
+        """
+        Operation that replaces existing datafiles in the dataset.
+        """
+
+        replacements: List[LanceOperation.DataReplacementGroup]
 
 
 class ScannerBuilder:
@@ -3002,9 +3100,19 @@ class ScannerBuilder:
                 # Serialize the pyarrow compute expression toSubstrait and use
                 # that as a filter.
                 scalar_schema = pa.schema(fields_without_lists)
-                self._substrait_filter = serialize_expressions(
+                substrait_filter = serialize_expressions(
                     [filter], ["my_filter"], scalar_schema
                 )
+                if isinstance(substrait_filter, memoryview):
+                    self._substrait_filter = substrait_filter.tobytes()
+                else:
+                    try:
+                        self._substrait_filter = substrait_filter.to_pybytes()
+                    except AttributeError:
+                        raise TypeError(
+                            "serialize_expressions returned unexpected"
+                            f"type {type(substrait_filter)}"
+                        )
             except ImportError:
                 # serialize_expressions was introduced in pyarrow 14.  Fallback to
                 # stringifying the expression if pyarrow is too old
@@ -3113,7 +3221,7 @@ class ScannerBuilder:
 
         if q_dim != dim:
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size" f" {dim}"
+                f"Query vector size {len(q)} does not match index column size {dim}"
             )
 
         if k is not None and int(k) <= 0:

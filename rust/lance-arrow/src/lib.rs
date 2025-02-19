@@ -822,7 +822,7 @@ impl BufferExt for arrow_buffer::Buffer {
         let mut buf = MutableBuffer::with_capacity(size_bytes);
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
-        buf.extend(std::iter::repeat(0).take(to_fill));
+        buf.extend(std::iter::repeat(0_u8).take(to_fill));
         Self::from(buf)
     }
 }
@@ -930,10 +930,7 @@ mod tests {
                 DataType::Struct(fields.clone()),
                 false,
             )]);
-            let children = types
-                .iter()
-                .map(|ty| new_empty_array(ty))
-                .collect::<Vec<_>>();
+            let children = types.iter().map(new_empty_array).collect::<Vec<_>>();
             let batch = RecordBatch::try_new(
                 Arc::new(schema.clone()),
                 vec![Arc::new(StructArray::new(fields, children, None)) as ArrayRef],

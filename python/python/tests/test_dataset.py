@@ -778,6 +778,16 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+def test_select_none(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+
+    assert "projection=[a]" in ds.scanner(
+        columns=[], filter="a < 50", with_row_id=True
+    ).explain_plan(True)
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1013,6 +1023,31 @@ def test_restore_with_commit(tmp_path: Path):
 
     tbl = dataset.to_table()
     assert tbl == table
+
+
+def test_merge_insert_with_commit():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+
+    assert isinstance(stats, dict)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    assert stats["num_deleted_rows"] == 0
+
+    assert isinstance(transaction, lance.Transaction)
+    assert isinstance(transaction.operation, lance.LanceOperation.Update)
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    assert dataset.to_table().sort_by("id") == pa.table(
+        {"id": range(10), "updated": [False] + [True] + [False] * 8}
+    )
 
 
 def test_merge_with_commit(tmp_path: Path):
@@ -1281,12 +1316,23 @@ def check_merge_stats(merge_dict, expected):
 
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
+    # Create a schema with some metadata to regress an issue where the metadata
+    # caused schema comparison problems in merge_insert.
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64()),
+            pa.field("c", pa.int64()),
+        ],
+        metadata={"foo": "bar"},
+    )
     table = pa.Table.from_pydict(
         {
             "a": range(nrows),
             "b": [1 for _ in range(nrows)],
             "c": [x % 2 for x in range(nrows)],
-        }
+        },
+        schema=schema,
     )
     dataset = lance.write_dataset(
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
@@ -1298,7 +1344,8 @@ def test_merge_insert(tmp_path: Path):
             "a": range(300, 300 + nrows),
             "b": [2 for _ in range(nrows)],
             "c": [0 for _ in range(nrows)],
-        }
+        },
+        schema=schema,
     )
 
     is_new = pc.field("b") == 2
@@ -1643,6 +1690,39 @@ def test_merge_insert_vector_column(tmp_path: Path):
 
     assert dataset.to_table().sort_by("key") == expected
     check_merge_stats(merge_dict, (1, 1, 0))
+
+
+def test_merge_insert_large():
+    # Doing subcolumns update with merge insert triggers this error.
+    # Data needs to be large enough to make DataFusion create multiple batches
+    # when outputting join results.
+    # https://github.com/lancedb/lance/issues/3406
+    # This test is in Python because for whatever reason, the error doesn't
+    # reproduce in the equivalent Rust test.
+    dims = 32
+    nrows = 20_000
+    data = pa.table({"id": range(nrows), "num": [str(i) for i in range(nrows)]})
+
+    ds = lance.write_dataset(data, "memory://")
+
+    ds.add_columns({"vector": f"arrow_cast(NULL, 'FixedSizeList({dims}, Float32)')"})
+
+    batch_size = 10_000
+    other_columns = pa.table(
+        {
+            "id": range(batch_size),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pc.random(batch_size * dims).cast(pa.float32()), dims
+            ),
+        }
+    )
+
+    (
+        ds.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(other_columns)
+    )
 
 
 def check_update_stats(update_dict, expected):
@@ -2130,7 +2210,7 @@ def test_scan_count_rows(tmp_path: Path):
     df = pd.DataFrame({"a": range(42), "b": range(42)})
     dataset = lance.write_dataset(df, base_dir)
 
-    assert dataset.scanner().count_rows() == 42
+    assert dataset.scanner(columns=[], with_row_id=True).count_rows() == 42
     assert dataset.count_rows(filter="a < 10") == 10
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
@@ -2843,3 +2923,28 @@ def test_dataset_schema(tmp_path: Path):
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
     ds._default_scan_options = {"with_row_id": True}
     assert ds.schema == ds.to_table().schema
+
+
+def test_data_replacement(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    data_file = fragment.files[0]
+    data_replacement = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    dataset = lance.LanceDataset.commit(dataset, data_replacement, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+            "b": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected

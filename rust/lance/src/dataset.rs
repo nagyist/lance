@@ -20,6 +20,7 @@ use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
+use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
@@ -36,9 +37,9 @@ use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -72,7 +73,10 @@ use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::io::commit::{commit_detached_transaction, commit_new_dataset, commit_transaction};
+use crate::io::commit::{
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    detect_overlapping_fragments,
+};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -85,7 +89,8 @@ pub use schema_evolution::{
 };
 pub use take::TakeBuilder;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeStats, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
@@ -1300,6 +1305,45 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        // Validate indices
+        let indices = self.load_indices().await?;
+        self.validate_indices(&indices)?;
+
+        Ok(())
+    }
+
+    fn validate_indices(&self, indices: &[Index]) -> Result<()> {
+        // Make sure there are no duplicate ids
+        let mut index_ids = HashSet::new();
+        for index in indices.iter() {
+            if !index_ids.insert(&index.uuid) {
+                return Err(Error::corrupt_file(
+                    self.manifest_file.clone(),
+                    format!(
+                        "Duplicate index id {} found in dataset {:?}",
+                        &index.uuid, self.base
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        // For each index name, make sure there is no overlap in fragment bitmaps
+        if let Err(err) = detect_overlapping_fragments(indices) {
+            let mut message = "Overlapping fragments detected in dataset.".to_string();
+            for (index_name, overlapping_frags) in err.bad_indices {
+                message.push_str(&format!(
+                    "\nIndex {:?} has overlapping fragments: {:?}",
+                    index_name, overlapping_frags
+                ));
+            }
+            return Err(Error::corrupt_file(
+                self.manifest_file.clone(),
+                message,
+                location!(),
+            ));
+        };
+
         Ok(())
     }
 
@@ -1675,6 +1719,7 @@ mod tests {
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
@@ -1700,12 +1745,13 @@ mod tests {
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
-    use lance_table::format::WriterVersion;
+    use lance_table::format::{DataFile, WriterVersion};
     use lance_table::io::commit::RenameCommitHandler;
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
@@ -3564,6 +3610,68 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
+    async fn test_replace_schema_metadata_preserves_fragments() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let manifest_before = dataset.manifest.clone();
+
+        let mut new_schema_meta = HashMap::new();
+        new_schema_meta.insert("new_key".to_string(), "new_value".to_string());
+        dataset
+            .replace_schema_metadata(new_schema_meta.clone())
+            .await
+            .unwrap();
+
+        let manifest_after = dataset.manifest.clone();
+
+        assert_eq!(manifest_before.fragments, manifest_after.fragments);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_replace_fragment_metadata_preserves_fragments() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let manifest_before = dataset.manifest.clone();
+
+        let mut new_field_meta = HashMap::new();
+        new_field_meta.insert("new_key".to_string(), "new_value".to_string());
+        dataset
+            .replace_field_metadata(vec![(0, new_field_meta.clone())])
+            .await
+            .unwrap();
+
+        let manifest_after = dataset.manifest.clone();
+
+        assert_eq!(manifest_before.fragments, manifest_after.fragments);
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_tag(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -4273,6 +4381,38 @@ mod tests {
                 .values(),
             &[0, 5, 10, 15]
         );
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
+        // In v0.21.0 and earlier, delta indices had a bug where the fragment bitmap
+        // could contain fragments that are part of other index deltas.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+        assert_eq!(dataset.load_indices().await.unwrap()[0].name, "vector_idx");
+
+        // Calling index statistics will force a migration
+        let stats = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["num_indexed_fragments"], 2);
+
+        dataset.checkout_latest().await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+        fn get_bitmap(meta: &Index) -> Vec<u32> {
+            meta.fragment_bitmap.as_ref().unwrap().iter().collect()
+        }
+        assert_eq!(get_bitmap(&indices[0]), vec![0]);
+        assert_eq!(get_bitmap(&indices[1]), vec![1]);
     }
 
     #[rstest]
@@ -5009,5 +5149,389 @@ mod tests {
         let result = dataset.append(reader, None).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_datafile_replacement() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let dataset = Arc::new(
+            Dataset::write(empty_reader, "memory://", None)
+                .await
+                .unwrap(),
+        );
+        dataset.validate().await.unwrap();
+
+        // Test empty replacement should commit a new manifest and do nothing
+        let mut dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset.clone()),
+            Operation::DataReplacement {
+                replacements: vec![],
+            },
+            Some(1),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(dataset.get_fragments().len(), 0);
+
+        // try the same thing on a non-empty dataset
+        let vals: Int32Array = vec![1, 2, 3].into();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vals)]).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![],
+            },
+            Some(3),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.version().version, 4);
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2, 3]
+        );
+
+        // write a new datafile
+        let object_writer = dataset
+            .object_store
+            .create(&Path::from("data/test.lance"))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            schema.as_ref().try_into().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let vals: Int32Array = vec![4, 5, 6].into();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vals)]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // find the datafile we want to replace
+        let frag = dataset.get_fragment(0).unwrap();
+        let data_file = frag.data_file_for_field(0).unwrap();
+        let mut new_data_file = data_file.clone();
+        new_data_file.path = "test.lance".to_string();
+
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, new_data_file)],
+            },
+            Some(5),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.version().version, 5);
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 1);
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[4, 5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datafile_partial_replacement() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let mut dataset = Dataset::write(empty_reader, "memory://", None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        let vals: Int32Array = vec![1, 2, 3].into();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vals)]).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fragment = dataset.get_fragments().pop().unwrap().metadata;
+
+        let extended_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+
+        // add all null column
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::Merge {
+                fragments: vec![fragment],
+                schema: extended_schema.as_ref().try_into().unwrap(),
+            },
+            Some(2),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let partial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Int32,
+            true,
+        )]));
+
+        // write a new datafile
+        let object_writer = dataset
+            .object_store
+            .create(&Path::from("data/test.lance"))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            partial_schema.as_ref().try_into().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let vals: Int32Array = vec![4, 5, 6].into();
+        let batch = RecordBatch::try_new(partial_schema.clone(), vec![Arc::new(vals)]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // find the datafile we want to replace
+        let new_data_file = DataFile {
+            path: "test.lance".to_string(),
+            // the second column in the dataset
+            fields: vec![1],
+            // is located in the first column of this datafile
+            column_indices: vec![0],
+            file_major_version: 2,
+            file_minor_version: 0,
+        };
+
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, new_data_file)],
+            },
+            Some(3),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.version().version, 4);
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+        assert_eq!(dataset.get_fragments()[0].metadata.files[0].fields, vec![0]);
+        assert_eq!(dataset.get_fragments()[0].metadata.files[1].fields, vec![1]);
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[4, 5, 6]
+        );
+
+        // do it again but on the first column
+        // find the datafile we want to replace
+        let new_data_file = DataFile {
+            path: "test.lance".to_string(),
+            // the first column in the dataset
+            fields: vec![0],
+            // is located in the first column of this datafile
+            column_indices: vec![0],
+            file_major_version: 2,
+            file_minor_version: 0,
+        };
+
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, new_data_file)],
+            },
+            Some(4),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.version().version, 5);
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[4, 5, 6]
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[4, 5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datafile_replacement_error() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let mut dataset = Dataset::write(empty_reader, "memory://", None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        let vals: Int32Array = vec![1, 2, 3].into();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vals)]).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fragment = dataset.get_fragments().pop().unwrap().metadata;
+
+        let extended_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+
+        // add all null column
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::Merge {
+                fragments: vec![fragment],
+                schema: extended_schema.as_ref().try_into().unwrap(),
+            },
+            Some(2),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // find the datafile we want to replace
+        let new_data_file = DataFile {
+            path: "test.lance".to_string(),
+            // the second column in the dataset
+            fields: vec![1],
+            // is located in the first column of this datafile
+            column_indices: vec![0],
+            file_major_version: 2,
+            file_minor_version: 0,
+        };
+
+        let new_data_file = DataFile {
+            fields: vec![0, 1],
+            ..new_data_file
+        };
+
+        let err = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, new_data_file)],
+            },
+            Some(4),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Expected to modify the fragment but no changes were made"));
     }
 }

@@ -11,6 +11,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -27,7 +28,7 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
@@ -476,7 +477,8 @@ impl LanceScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
-            datafusion::physical_plan::ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,

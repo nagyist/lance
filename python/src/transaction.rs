@@ -3,9 +3,11 @@
 
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
-use lance::dataset::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use lance::dataset::transaction::{
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+};
 use lance::datatypes::Schema;
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{DataFile, Fragment, Index};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
@@ -14,6 +16,32 @@ use uuid::Uuid;
 
 use crate::schema::LanceSchema;
 use crate::utils::{class_name, export_vec, extract_vec, PyLance};
+
+impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
+        let new_file = &ob.getattr("new_file")?.extract::<PyLance<DataFile>>()?;
+
+        Ok(Self(DataReplacementGroup(fragment_id, new_file.0.clone())))
+    }
+}
+
+impl ToPyObject for PyLance<&DataReplacementGroup> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        let namespace = py
+            .import_bound(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
+            .expect("Failed to import LanceOperation namespace");
+
+        let fragment_id = self.0 .0;
+        let new_file = PyLance(&self.0 .1).to_object(py);
+
+        let cls = namespace
+            .getattr("DataReplacementGroup")
+            .expect("Failed to get DataReplacementGroup class");
+        cls.call1((fragment_id, new_file)).unwrap().to_object(py)
+    }
+}
 
 impl FromPyObject<'_> for PyLance<Operation> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -44,6 +72,20 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     deleted_fragment_ids,
                     predicate,
+                };
+                Ok(Self(op))
+            }
+            "Update" => {
+                let removed_fragment_ids = ob.getattr("removed_fragment_ids")?.extract()?;
+
+                let updated_fragments = extract_vec(&ob.getattr("updated_fragments")?)?;
+
+                let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
+
+                let op = Operation::Update {
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
                 };
                 Ok(Self(op))
             }
@@ -104,6 +146,13 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
+            "DataReplacement" => {
+                let replacements = extract_vec(&ob.getattr("replacements")?)?;
+
+                let op = Operation::DataReplacement { replacements };
+
+                Ok(Self(op))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),
@@ -142,6 +191,28 @@ impl ToPyObject for PyLance<&Operation> {
                 cls.call1((schema_py, fragments_py))
                     .expect("Failed to create Overwrite instance")
                     .to_object(py)
+            }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => {
+                let removed_fragment_ids = removed_fragment_ids.to_object(py);
+                let updated_fragments = export_vec(py, updated_fragments.as_slice());
+                let new_fragments = export_vec(py, new_fragments.as_slice());
+                let cls = namespace
+                    .getattr("Update")
+                    .expect("Failed to get Update class");
+                cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
+                    .unwrap()
+                    .to_object(py)
+            }
+            Operation::DataReplacement { replacements } => {
+                let replacements = export_vec(py, replacements.as_slice());
+                let cls = namespace
+                    .getattr("DataReplacement")
+                    .expect("Failed to get DataReplacement class");
+                cls.call1((replacements,)).unwrap().to_object(py)
             }
             _ => todo!(),
         }

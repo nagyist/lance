@@ -162,7 +162,12 @@ public class ScannerTest {
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
         try (LanceScanner scanner =
-            dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(Arrays.asList())
+                    .withRowId(true)
+                    .filter("id < 20")
+                    .build())) {
           assertEquals(20, scanner.countRows());
         }
       }
@@ -179,7 +184,7 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner = fragment.newScan(batchRows)) {
           testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
         }
@@ -196,7 +201,7 @@ public class ScannerTest {
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner =
             fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
@@ -215,7 +220,7 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner =
             fragment.newScan(
                 new ScanOptions.Builder()
@@ -256,7 +261,7 @@ public class ScannerTest {
       FragmentOperation.Append appendOp =
           new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        List<DatasetFragment> frags = dataset.getFragments();
+        List<Fragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
         validScanResult(dataset, frags.get(0).getId(), 3);
         validScanResult(dataset, frags.get(1).getId(), 5);
@@ -278,7 +283,7 @@ public class ScannerTest {
       FragmentOperation.Append appendOp =
           new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        List<DatasetFragment> frags = dataset.getFragments();
+        List<Fragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
         try (Scanner scanner =
             dataset.newScan(
@@ -387,7 +392,6 @@ public class ScannerTest {
           // This test is more about ensuring that the batchReadahead parameter is accepted
           // and doesn't cause errors. The actual effect of batchReadahead might not be
           // directly observable in this test.
-          assertEquals(totalRows, scanner.countRows());
           try (ArrowReader reader = scanner.scanBatches()) {
             int rowCount = 0;
             while (reader.loadNextBatch()) {

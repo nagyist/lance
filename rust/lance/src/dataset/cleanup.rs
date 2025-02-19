@@ -476,7 +476,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
-    use snafu::{location, Location};
+    use snafu::location;
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
@@ -556,7 +556,7 @@ mod tests {
         pub clock: MockClock<'a>,
     }
 
-    impl<'a> MockDatasetFixture<'a> {
+    impl MockDatasetFixture<'_> {
         fn try_new() -> Result<Self> {
             let tmpdir = tempdir()?;
             // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;

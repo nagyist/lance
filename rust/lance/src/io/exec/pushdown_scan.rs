@@ -15,7 +15,8 @@ use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::{ColumnarValue, ExecutionMode, PlanProperties};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{ColumnarValue, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
@@ -32,7 +33,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
@@ -131,7 +132,8 @@ impl LancePushdownScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Ok(Self {

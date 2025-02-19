@@ -14,7 +14,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
@@ -24,14 +24,16 @@ use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::binary::{BinaryBlockEncoder, BinaryMiniBlockEncoder};
+use crate::encodings::physical::binary::{BinaryMiniBlockEncoder, VariableEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
-use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
+use crate::encodings::physical::fsst::{
+    FsstArrayEncoder, FsstMiniBlockEncoder, FsstPerValueEncoder,
+};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
@@ -217,9 +219,19 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
 /// A single buffer of value data and a buffer of offsets
 ///
 /// TODO: In the future we may allow metadata buffers
+#[derive(Debug)]
 pub enum PerValueDataBlock {
     Fixed(FixedWidthDataBlock),
     Variable(VariableWidthBlock),
+}
+
+impl PerValueDataBlock {
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::Fixed(fixed) => fixed.data_size(),
+            Self::Variable(variable) => variable.data_size(),
+        }
+    }
 }
 
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
@@ -235,28 +247,6 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)>;
-}
-
-/// Trait for compression algorithms that are suitable for use in the zipped structural encoding
-///
-/// This encoding is useful for non-short strings, binary, and variable length lists
-/// (i.e. when the average value is >= 128 bytes)
-///
-/// These compressors can be extremely generic.  They only need to produce one buffer of bytes
-/// and another buffer of offsets into the bytes, one offset for each value.  Both of these buffers
-/// will be stored.
-///
-/// Note: It is perfectly legal for a value to have 0 bytes.  However, we still need to store the
-/// offset itself.  This means that this compressor, when implemented by something like RLE will not
-/// be as efficient (space-wise) as a block version (which could skip the offsets for runs).
-///
-/// Accessing this data will require 2 IOPS and accessing in a random-access fashion will require
-/// a repetition index.
-pub trait VariablePerValueCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer where each value is encoded with a different size
-    ///
-    /// Also returns a description of the compression that can be used to decompress when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<(VariableWidthBlock, pb::ArrayEncoding)>;
 }
 
 /// Trait for compression algorithms that compress an entire block of data into one opaque
@@ -503,13 +493,26 @@ impl CoreArrayEncodingStrategy {
         let bin_indices_encoder =
             Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
 
-        let compression = field_meta.and_then(Self::get_field_compression);
-
-        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
-        if compression.is_none() && Self::can_use_fsst(data_type, data_size, version) {
-            Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+        if let Some(compression) = field_meta.and_then(Self::get_field_compression) {
+            if compression.scheme == CompressionScheme::Fsst {
+                // User requested FSST
+                let raw_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+                Ok(Box::new(FsstArrayEncoder::new(raw_encoder)))
+            } else {
+                // Generic compression
+                Ok(Box::new(BinaryEncoder::new(
+                    bin_indices_encoder,
+                    Some(compression),
+                )))
+            }
         } else {
-            Ok(bin_encoder)
+            // No user-specified compression, use FSST if we can
+            let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+            if Self::can_use_fsst(data_type, data_size, version) {
+                Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+            } else {
+                Ok(bin_encoder)
+            }
         }
     }
 
@@ -884,8 +887,23 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 let encoder = Box::new(ValueEncoder::default());
                 Ok(encoder)
             }
-            DataBlock::VariableWidth(_variable_width) => {
-                todo!()
+            DataBlock::VariableWidth(variable_width) => {
+                if variable_width.bits_per_offset == 32 {
+                    let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                    let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+
+                    let variable_compression = Box::new(VariableEncoder::default());
+
+                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    {
+                        Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
+                    } else {
+                        Ok(variable_compression)
+                    }
+                } else {
+                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
             }
             _ => unreachable!(),
         }
@@ -905,13 +923,9 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 Ok((encoder, encoding))
             }
             DataBlock::VariableWidth(variable_width) => {
-                if variable_width.bits_per_offset == 32 {
-                    let encoder = Box::new(BinaryBlockEncoder::default());
-                    let encoding = ProtobufUtils::binary_block();
-                    Ok((encoder, encoding))
-                } else {
-                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
-                }
+                let encoder = Box::new(VariableEncoder::default());
+                let encoding = ProtobufUtils::variable(variable_width.bits_per_offset);
+                Ok((encoder, encoding))
             }
             _ => unreachable!(),
         }

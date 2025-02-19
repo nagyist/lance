@@ -17,6 +17,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
@@ -31,7 +32,7 @@ use object_store::{
 };
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use url::Url;
@@ -501,7 +502,7 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: 4 * 1024,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -784,7 +785,7 @@ impl StorageOptions {
     pub fn download_retry_count(&self) -> usize {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "download_retry_count")
+            .find(|(key, _)| key.eq_ignore_ascii_case("download_retry_count"))
             .map(|(_, value)| value.parse::<usize>().unwrap_or(3))
             .unwrap_or(3)
     }
@@ -793,7 +794,7 @@ impl StorageOptions {
     pub fn client_max_retries(&self) -> usize {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "client_max_retries")
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
             .and_then(|(_, value)| value.parse::<usize>().ok())
             .unwrap_or(10)
     }
@@ -802,7 +803,7 @@ impl StorageOptions {
     pub fn client_retry_timeout(&self) -> u64 {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "client_retry_timeout")
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_retry_timeout"))
             .and_then(|(_, value)| value.parse::<u64>().ok())
             .unwrap_or(180)
     }
@@ -858,6 +859,8 @@ async fn configure_store(
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
     // block size where we don't see a latency penalty.
+    let file_block_size = options.block_size.unwrap_or(4 * 1024);
+    let cloud_block_size = options.block_size.unwrap_or(64 * 1024);
     match url.scheme() {
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
@@ -916,7 +919,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: Arc::new(store).traced(),
                 scheme: String::from(url.scheme()),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -935,7 +938,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -950,7 +953,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -961,14 +964,21 @@ async fn configure_store(
         // however this makes testing harder as we can't use the same code path
         // "file-object-store" forces local file system dataset to use the same
         // code path as cloud object stores
-        "file" => Ok(ObjectStore::from_path(url.path())?.0),
+        "file" => {
+            let mut object_store = ObjectStore::from_path(url.path())?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
+        }
         "file-object-store" => {
-            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
+            let mut object_store =
+                ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
         }
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: file_block_size,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -1028,14 +1038,6 @@ fn infer_block_size(scheme: &str) -> usize {
         "file" => 4 * 1024,
         _ => 64 * 1024,
     }
-}
-
-fn str_is_truthy(val: &str) -> bool {
-    val.eq_ignore_ascii_case("1")
-        | val.eq_ignore_ascii_case("true")
-        | val.eq_ignore_ascii_case("on")
-        | val.eq_ignore_ascii_case("yes")
-        | val.eq_ignore_ascii_case("y")
 }
 
 /// Attempt to create a Url from given table location.
@@ -1112,6 +1114,7 @@ lazy_static::lazy_static! {
 mod tests {
     use super::*;
     use parquet::data_type::AsBytes;
+    use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
     use std::path::Path as StdPath;
@@ -1175,6 +1178,65 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+    }
+
+    async fn test_block_size_used_test_helper(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        default_expected_block_size: usize,
+    ) {
+        // Test the default
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, default_expected_block_size);
+
+        // Ensure param is used
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
+    }
+
+    #[rstest]
+    #[case("s3://bucket/foo.lance", None)]
+    #[case("gs://bucket/foo.lance", None)]
+    #[case("az://account/bucket/foo.lance",
+      Some(HashMap::from([
+            (String::from("account_name"), String::from("account")),
+            (String::from("container_name"), String::from("container"))
+           ])))]
+    #[tokio::test]
+    async fn test_block_size_used_cloud(
+        #[case] uri: &str,
+        #[case] storage_options: Option<HashMap<String, String>>,
+    ) {
+        test_block_size_used_test_helper(uri, storage_options, 64 * 1024).await;
+    }
+
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[case("memory:///bucket/foo.lance")]
+    #[tokio::test]
+    async fn test_block_size_used_file(#[case] prefix: &str) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let path = format!("{tmp_path}/bar/foo.lance/test_file");
+        write_to_file(&path, "URL").unwrap();
+        let uri = format!("{prefix}:///{path}");
+        test_block_size_used_test_helper(&uri, None, 4 * 1024).await;
     }
 
     #[tokio::test]

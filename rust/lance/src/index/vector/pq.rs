@@ -31,7 +31,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::{instrument, span, Level};
 
 // Re-export
@@ -242,10 +242,10 @@ impl VectorIndex for PQIndex {
                 for idx in indices.values().iter() {
                     let dist = distances.value(*idx as usize);
                     let id = row_ids.value(*idx as usize);
-                    if query.lower_bound.map_or(false, |lb| dist < lb) {
+                    if query.lower_bound.is_some_and(|lb| dist < lb) {
                         continue;
                     }
-                    if query.upper_bound.map_or(false, |ub| dist >= ub) {
+                    if query.upper_bound.is_some_and(|ub| dist >= ub) {
                         break;
                     }
 
@@ -447,6 +447,7 @@ pub async fn build_pq_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    assert_eq!(training_data.logical_null_count(), 0);
 
     info!(
         "starting to compute partitions for PQ training, sample size: {}",

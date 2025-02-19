@@ -14,7 +14,7 @@ use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32A
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_linalg::kernels::normalize_fsl;
@@ -132,25 +132,20 @@ impl Transformer for KeepFiniteVectors {
             }
         };
 
-        let valid = data
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, arr)| {
-                arr.and_then(|data| {
-                    let is_valid = match data.data_type() {
-                        DataType::Float16 => is_all_finite::<Float16Type>(&data),
-                        DataType::Float32 => is_all_finite::<Float32Type>(&data),
-                        DataType::Float64 => is_all_finite::<Float64Type>(&data),
-                        _ => false,
-                    };
-                    if is_valid {
-                        Some(idx as u32)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut valid = Vec::with_capacity(batch.num_rows());
+        data.iter().enumerate().for_each(|(idx, arr)| {
+            if let Some(data) = arr {
+                let is_valid = match data.data_type() {
+                    DataType::Float16 => is_all_finite::<Float16Type>(&data),
+                    DataType::Float32 => is_all_finite::<Float32Type>(&data),
+                    DataType::Float64 => is_all_finite::<Float64Type>(&data),
+                    _ => false,
+                };
+                if is_valid {
+                    valid.push(idx as u32);
+                }
+            };
+        });
         if valid.len() < batch.num_rows() {
             let indices = UInt32Array::from(valid);
             Ok(batch.take(&indices)?)

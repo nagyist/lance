@@ -4,7 +4,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{PrimitiveArray, UInt32Array};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -198,6 +198,16 @@ impl ReadBatchParams {
                 "cannot materialize RangeFrom",
                 location!(),
             )),
+        }
+    }
+
+    pub fn to_offsets_total(&self, total: u32) -> PrimitiveArray<UInt32Type> {
+        match self {
+            Self::Indices(indices) => indices.clone(),
+            Self::Range(r) => UInt32Array::from_iter_values(r.start as u32..r.end as u32),
+            Self::RangeFull => UInt32Array::from_iter_values(0_u32..total),
+            Self::RangeTo(r) => UInt32Array::from_iter_values(0..r.end as u32),
+            Self::RangeFrom(r) => UInt32Array::from_iter_values(r.start as u32..total),
         }
     }
 }

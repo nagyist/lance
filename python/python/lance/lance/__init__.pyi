@@ -265,6 +265,7 @@ class _Dataset:
         storage_options: Optional[Dict[str, str]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
+    def drop_index(self, name: str): ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
@@ -391,8 +392,9 @@ def _write_fragments(
     max_rows_per_group: int,
     max_bytes_per_file: int,
     progress: Optional[FragmentWriteProgress],
-    data_storage_version=Optional[str],
-    storage_options=Optional[Dict[str, str]],
+    data_storage_version: Optional[str],
+    storage_options: Optional[Dict[str, str]],
+    enable_move_stable_row_ids: bool,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -402,8 +404,9 @@ def _write_fragments_transaction(
     max_rows_per_group: int,
     max_bytes_per_file: int,
     progress: Optional[FragmentWriteProgress],
-    data_storage_version=Optional[str],
-    storage_options=Optional[Dict[str, str]],
+    data_storage_version: Optional[str],
+    storage_options: Optional[Dict[str, str]],
+    enable_move_stable_row_ids: bool,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

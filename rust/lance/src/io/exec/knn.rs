@@ -11,13 +11,17 @@ use arrow_array::{
     ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::stats::Precision;
+use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion::physical_plan::{ExecutionMode, PlanProperties};
+use datafusion::{
+    common::stats::Precision,
+    physical_plan::execution_plan::{Boundedness, EmissionType},
+};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -29,7 +33,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
@@ -181,18 +185,30 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.statistics()?;
-        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let schema = self.input.schema();
+        let dist_stats = inner_stats
+            .column_statistics
+            .iter()
+            .zip(schema.fields())
+            .find(|(_, field)| field.name() == &self.column)
+            .map(|(stats, _)| ColumnStatistics {
+                null_count: stats.null_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats])
+            .zip(schema.fields())
+            .filter(|(_, field)| field.name() != DIST_COL)
+            .map(|(stats, _)| stats)
+            .chain(std::iter::once(dist_stats))
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
-        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -277,7 +293,8 @@ impl ANNIvfPartitionExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Ok(Self {
@@ -436,7 +453,8 @@ impl ANNIvfSubIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Ok(Self {
             input,
@@ -490,22 +508,25 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        let plan = if children.len() == 1 || children.len() == 2 {
+            if children.len() == 2 {
+                let _prefilter = children.pop().expect("length checked");
+            }
+            // NOTE!!!! Prefilter transformation is ignored.
+            Self {
+                input: children.pop().expect("length checked"),
+                dataset: self.dataset.clone(),
+                indices: self.indices.clone(),
+                query: self.query.clone(),
+                prefilter_source: self.prefilter_source.clone(),
+                properties: self.properties.clone(),
+            }
+        } else {
             return Err(DataFusionError::Internal(
-                "ANNSubIndexExec node must have exactly one child".to_string(),
+                "ANNSubIndexExec node must have exactly one or two (prefilter) child".to_string(),
             ));
-        }
-
-        let new_plan = Self {
-            input: children.pop().expect("length checked"),
-            dataset: self.dataset.clone(),
-            indices: self.indices.clone(),
-            query: self.query.clone(),
-            prefilter_source: self.prefilter_source.clone(),
-            properties: self.properties.clone(),
         };
-
-        Ok(Arc::new(new_plan))
+        Ok(Arc::new(plan))
     }
 
     fn execute(

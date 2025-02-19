@@ -25,7 +25,7 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuf
 use arrow_schema::DataType;
 use bytemuck::try_cast_slice;
 use lance_arrow::DataTypeExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -628,6 +628,16 @@ impl VariableWidthBlock {
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
+        })
+    }
+
+    pub fn offsets_as_block(&mut self) -> DataBlock {
+        let offsets = self.offsets.borrow_and_clone();
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: offsets,
+            bits_per_value: self.bits_per_offset as u64,
+            num_values: self.num_values + 1,
+            block_info: BlockInfo::new(),
         })
     }
 

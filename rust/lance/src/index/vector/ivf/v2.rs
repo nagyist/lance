@@ -51,7 +51,7 @@ use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
@@ -742,6 +742,7 @@ mod tests {
             .zip(row_ids.into_iter())
             .collect::<Vec<_>>();
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
+        assert!(row_ids.len() == k);
 
         let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();

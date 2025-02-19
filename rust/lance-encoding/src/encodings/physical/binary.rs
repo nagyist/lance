@@ -12,19 +12,24 @@ use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::TryFutureExt;
 use lance_core::utils::bit::pad_bytes;
-use snafu::{location, Location};
+use snafu::location;
 
 use futures::{future::BoxFuture, FutureExt};
 
-use crate::decoder::{BlockDecompressor, LogicalPageDecoder, MiniBlockDecompressor};
-use crate::encoder::{BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor};
+use crate::decoder::{
+    BlockDecompressor, LogicalPageDecoder, MiniBlockDecompressor, VariablePerValueDecompressor,
+};
+use crate::encoder::{
+    BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
+    PerValueDataBlock,
+};
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, DataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
 };
-use crate::format::ProtobufUtils;
+use crate::format::{pb, ProtobufUtils};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -687,16 +692,13 @@ impl BinaryMiniBlockEncoder {
                 chunks,
                 num_values: data.num_values,
             },
-            ProtobufUtils::binary_miniblock(),
+            ProtobufUtils::variable(/*bits_per_value=*/ 32),
         )
     }
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(
-        &self,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::InvalidInput {
@@ -740,9 +742,11 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     }
 }
 
+/// Most basic encoding for variable-width data which does no compression at all
 #[derive(Debug, Default)]
-pub struct BinaryBlockEncoder {}
-impl BlockCompressor for BinaryBlockEncoder {
+pub struct VariableEncoder {}
+
+impl BlockCompressor for VariableEncoder {
     fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
         let num_values: u32 = data
             .num_values()
@@ -785,6 +789,26 @@ impl BlockCompressor for BinaryBlockEncoder {
     }
 }
 
+impl PerValueCompressor for VariableEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+        let DataBlock::VariableWidth(variable) = data else {
+            panic!("BinaryPerValueCompressor can only work with Variable Width DataBlock.");
+        };
+
+        let encoding = ProtobufUtils::variable(variable.bits_per_offset);
+        Ok((PerValueDataBlock::Variable(variable), encoding))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VariableDecoder {}
+
+impl VariablePerValueDecompressor for VariableDecoder {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        Ok(DataBlock::VariableWidth(data))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BinaryBlockDecompressor {}
 
@@ -823,6 +847,10 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field};
 
+    use lance_core::datatypes::{
+        COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -878,9 +906,37 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        let field = Field::new("", DataType::Binary, false);
+        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let field = Field::new("", data_type, false).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, version).await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_binary_fsst(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
+
+        let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -897,10 +953,22 @@ pub mod tests {
 
     #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_utf8_binary(
+    async fn test_simple_binary(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
+        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
+
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
+        let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
 
         let test_cases = TestCases::default()
             .with_range(0..2)
@@ -911,7 +979,7 @@ pub mod tests {
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
-            HashMap::new(),
+            field_metadata,
         )
         .await;
     }
@@ -1036,15 +1104,6 @@ pub mod tests {
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
-    }
-
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_binary_miniblock(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
-        let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]

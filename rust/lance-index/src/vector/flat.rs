@@ -6,13 +6,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::AsArray;
+use arrow::{array::AsArray, buffer::NullBuffer};
 use arrow_array::{make_array, Array, ArrayRef, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
 use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::{multivec_distance, DistanceType};
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use super::DIST_COL;
@@ -44,9 +44,9 @@ pub async fn compute_distance(
         .clone();
 
     let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
-        rowids.nulls().map(|nulls| nulls.buffer().clone())
+        NullBuffer::union(rowids.nulls(), vectors.nulls())
     } else {
-        None
+        vectors.nulls().cloned()
     };
 
     tokio::task::spawn_blocking(move || {
@@ -56,7 +56,7 @@ pub async fn compute_distance(
         let vectors = vectors
             .into_data()
             .into_builder()
-            .null_bit_buffer(validity_buffer)
+            .null_bit_buffer(validity_buffer.map(|b| b.buffer().clone()))
             .build()
             .map(make_array)?;
         let distances = match vectors.data_type() {
