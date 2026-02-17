@@ -4886,6 +4886,8 @@ dependencies = [
  "log",
  "pin-project",
  "prost",
+ "prost-build",
+ "protobuf-src",
  "snafu",
  "tokio",
  "tracing",
